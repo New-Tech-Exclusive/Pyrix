@@ -12,7 +12,7 @@
 - it has a config menu to toggle line numbers and edit colors
 - it has a startup dashboard with quick-start keybinding hints
 - Neovim/Vim style keybindings
-- Any file not specified at startup is automatically in 'Notebook Mode' allowing for quick notes and no extra bloat from a useless text file
+- **Any file not specified at startup is automatically in 'Notebook Mode' allowing for quick notes and no extra bloat from a useless text file**
 
 ---
 
