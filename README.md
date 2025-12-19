@@ -42,7 +42,7 @@
    chmod +x pyrix.py
    ```
 
-4. **Make Pyrix available system-wide (optional, but recommended)**:
+4. **Make Pyrix available system-wide** (optional, but recommended):
    ```bash
    mkdir -p ~/.local/bin
    cp pyrix.py ~/.local/bin/pyrix
