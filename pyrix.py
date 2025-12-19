@@ -464,10 +464,10 @@ class Editor:
             "  ██║        ██║   ██║  ██║██║██╔╝ ██╗",
             "  ╚═╝        ╚═╝   ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝",
             "",
-            "        Modular • Fast • Tokyonight",
+            "        Modular • Fast • Tokyonight (Changeable)",
             "",
-            "       [i] New File    [:] Command ",
-            "       [q] Quit        [u] Update  "
+            "       [i] Notebook Mode    [:] Command ",
+            "       [q] Quit             [u] Update  "
         ]
         start_y = (h - len(logo)) // 2
         for i, line in enumerate(logo):

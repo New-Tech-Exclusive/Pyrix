@@ -93,6 +93,14 @@ Access the configuration menu by typing `:config` in **NORMAL** mode.
 
 ---
 
+## Known issues
+
+- Cursor at end of config menu
+- Config menu is VERY small (Not an issue for people who don't care about customization)
+- Highlights for python and language server for python are active for other languages (Like literally right now as i'm writing this)
+- Arrow keys can't be used in insert or view mode
+
+---
 ## 📄 License
 
 Distributed under the GPL-2.0 License.
