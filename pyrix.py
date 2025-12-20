@@ -6,12 +6,22 @@ import re
 import time
 import builtins
 import keyword
-
+import pty
+import fcntl
+import select
+import struct
+import subprocess
+import termios
+'''
+Good Luck any contributors, i'm going to be honest, this code kinda sucks and is a bit of a mess. I'm not the best with formatting and organization (as you can see, it one file) so good luck
+theres some comments in the code that might help you out
+'''
 NORMAL = "NORMAL"
 INSERT = "INSERT"
 COMMAND = "COMMAND"
 CONFIG = "CONFIG"
 AUTOCOMPLETE = "AUTOCOMPLETE"
+TERMINAL = "TERMINAL"
 
 class Editor:
     def __init__(self, stdscr, filename=None):
@@ -35,6 +45,10 @@ class Editor:
         self.ac_suggestions = []
         self.ac_index = 0
         self.is_python = filename and filename.endswith('.py')
+        
+        self.term_fd = None
+        self.term_pid = None
+        self.terminal = None
         
         if self.is_python:
             self.lsp = PythonLSP()
@@ -60,6 +74,7 @@ class Editor:
 
         if curses.has_colors():
             curses.start_color()
+            curses.use_default_colors()
             if curses.can_change_color():
                 for i, opt in enumerate(self.config_options):
                     if opt["type"] == "color":
@@ -75,6 +90,31 @@ class Editor:
                 curses.init_pair(21, 20, 23) # Segment ACTIVE text on status bg
                 curses.init_pair(22, 23, 0) # Dark text on black
                 curses.init_pair(23, 10, 23) # Default fg on status bg
+                
+                # ANSI 16 colors (pairs 40-55)
+                # These are the standard 8 colors + bright versions
+                # curses.COLOR_BLACK, curses.COLOR_RED, curses.COLOR_GREEN, curses.COLOR_YELLOW,
+                # curses.COLOR_BLUE, curses.COLOR_MAGENTA, curses.COLOR_CYAN, curses.COLOR_WHITE
+                curses.init_pair(40, curses.COLOR_BLACK, -1) # Black
+                curses.init_pair(41, curses.COLOR_RED, -1) # Red
+                curses.init_pair(42, curses.COLOR_GREEN, -1) # Green
+                curses.init_pair(43, curses.COLOR_YELLOW, -1) # Yellow
+                curses.init_pair(44, curses.COLOR_BLUE, -1) # Blue
+                curses.init_pair(45, curses.COLOR_MAGENTA, -1) # Magenta
+                curses.init_pair(46, curses.COLOR_CYAN, -1) # Cyan
+                curses.init_pair(47, curses.COLOR_WHITE, -1) # White
+                
+                # Bright versions (often just A_BOLD with the regular color)
+                # For simplicity, we'll map them to the same base colors for now,
+                # and rely on A_BOLD for the bright effect in TerminalEmulator.
+                curses.init_pair(48, curses.COLOR_BLACK, -1) # Bright Black (Grey)
+                curses.init_pair(49, curses.COLOR_RED, -1) # Bright Red
+                curses.init_pair(50, curses.COLOR_GREEN, -1) # Bright Green
+                curses.init_pair(51, curses.COLOR_YELLOW, -1) # Bright Yellow
+                curses.init_pair(52, curses.COLOR_BLUE, -1) # Bright Blue
+                curses.init_pair(53, curses.COLOR_MAGENTA, -1) # Bright Magenta
+                curses.init_pair(54, curses.COLOR_CYAN, -1) # Bright Cyan
+                curses.init_pair(55, curses.COLOR_WHITE, -1) # Bright White
             else:
                 curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
                 curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)
@@ -95,7 +135,12 @@ class Editor:
         self.stdscr.timeout(100)
 
         while True:
+            if self.mode == TERMINAL:
+                self.update_terminal()
+            
             self.draw()
+            # Set timeout for getch when in terminal mode to poll output
+            self.stdscr.timeout(10 if self.mode == TERMINAL else 100)
             key = self.stdscr.getch()
 
             if key == -1:
@@ -125,6 +170,8 @@ class Editor:
                 self.handle_config(key)
             elif self.mode == AUTOCOMPLETE:
                 self.handle_autocomplete(key)
+            elif self.mode == TERMINAL:
+                self.handle_terminal(key)
 
     def save_state(self):
         # Limit undo stack size to 100
@@ -189,6 +236,15 @@ class Editor:
     def handle_insert(self, key):
         if key == 27:  # ESC
             self.mode = NORMAL
+            self.ac_suggestions = []
+        elif key == curses.KEY_UP:
+            self.move(0, -1)
+        elif key == curses.KEY_DOWN:
+            self.move(0, 1)
+        elif key == curses.KEY_LEFT:
+            self.move(-1, 0)
+        elif key == curses.KEY_RIGHT and not self.ac_suggestions:
+            self.move(1, 0)
         elif key in (curses.KEY_BACKSPACE, 127):
             self.save_state()
             self.backspace()
@@ -245,6 +301,8 @@ class Editor:
             elif cmd == "config":
                 self.mode = CONFIG
                 self.config_index = 0
+            elif cmd == "term":
+                self.open_terminal()
             else:
                 self.mode = NORMAL
         elif key in (curses.KEY_BACKSPACE, 127):
@@ -335,9 +393,11 @@ class Editor:
                     self.update_color_definition(opt)
                 self.is_inputting = False
                 self.config_input = ""
+                curses.curs_set(0) # Hide cursor during navigation
             elif key == 27:  # ESC
                 self.is_inputting = False
                 self.config_input = ""
+                curses.curs_set(0) # Hide cursor during navigation
             elif key in (curses.KEY_BACKSPACE, 127):
                 self.config_input = self.config_input[:-1]
             elif 32 <= key <= 126:
@@ -346,6 +406,7 @@ class Editor:
 
         if key == 27 or key == ord('q'):  # ESC or q
             self.mode = NORMAL
+            curses.curs_set(1) # Show cursor in normal mode
         elif key == ord('j') or key == curses.KEY_DOWN:
             self.config_index = (self.config_index + 1) % len(self.config_options)
         elif key == ord('k') or key == curses.KEY_UP:
@@ -358,13 +419,17 @@ class Editor:
             elif opt["type"] == "color":
                 self.is_inputting = True
                 self.config_input = opt["hex"]
+                curses.curs_set(1) # Show cursor while typing
 
     def draw_config_menu(self):
         h, w = self.stdscr.getmaxyx()
-        menu_h = len(self.config_options) + 6
-        menu_w = 50
+        menu_h = len(self.config_options) + 8
+        menu_w = 60
         start_y = (h - menu_h) // 2
         start_x = (w - menu_w) // 2
+        
+        if not self.is_inputting:
+            curses.curs_set(0) # Hide cursor in menu
 
         # Draw box
         for i in range(menu_h):
@@ -416,6 +481,8 @@ class Editor:
 
     def get_line_colors(self, line):
         colors = [0] * len(line)
+        if not self.is_python:
+            return colors
         
         # Simple regex-based highlighting
         keywords = r'\b(if|else|elif|while|for|in|import|from|as|return|yield|try|except|finally|with|pass|break|continue|None|True|False|and|or|not|is|lambda)\b'
@@ -497,32 +564,131 @@ class Editor:
             msg = f" {n['msg']} "
             self.stdscr.addstr(h - 4 - i, w - len(msg) - 2, msg, curses.color_pair(21) | curses.A_BOLD)
 
+    def open_terminal(self):
+        h, w = self.stdscr.getmaxyx()
+        self.terminal = TerminalEmulator(h - 2, w)
+        pid, fd = pty.fork()
+        if pid == 0:  # Child process
+            # Set environment variable to signal we are in pyrix
+            os.environ["TERM"] = "xterm"
+            shell = os.environ.get("SHELL", "/bin/bash")
+            os.execv(shell, [shell])
+        else:  # Parent process
+            self.term_fd = fd
+            self.term_pid = pid
+            self.mode = TERMINAL
+            # Set non-blocking
+            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+            # Set size
+            winsize = struct.pack("HHHH", h - 2, w, 0, 0)
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+
+    def handle_terminal(self, key):
+        if key == 23:  # Ctrl+W to exit
+            self.mode = NORMAL
+            return
+        
+        try:
+            # Map curses keys to ANSI sequences
+            mappping = {
+                curses.KEY_UP: b"\x1b[A",
+                curses.KEY_DOWN: b"\x1b[B",
+                curses.KEY_RIGHT: b"\x1b[C",
+                curses.KEY_LEFT: b"\x1b[D",
+                curses.KEY_HOME: b"\x1b[H",
+                curses.KEY_END: b"\x1b[F",
+                curses.KEY_PPAGE: b"\x1b[5~",
+                curses.KEY_NPAGE: b"\x1b[6~",
+                curses.KEY_DC: b"\x1b[3~",
+                curses.KEY_IC: b"\x1b[2~",
+            }
+            if key in mappping:
+                os.write(self.term_fd, mappping[key])
+            elif key == curses.KEY_BACKSPACE or key == 127:
+                os.write(self.term_fd, b"\x08")
+            elif key == 10:
+                os.write(self.term_fd, b"\n")
+            elif key == 9: # Tab
+                os.write(self.term_fd, b"\t")
+            elif 0 <= key <= 255:
+                os.write(self.term_fd, bytes([key]))
+        except OSError:
+            pass
+
+    def sanitize_ansi(self, data):
+        # Strip CSI (Control Sequence Introducer)
+        # Proper CSI termination characters are in the range 0x40-0x7E (@ through ~)
+        data = re.sub(r'\x1b\[[0-9;?]*[@-~]', '', data)
+        # Strip OSC (Operating System Command) - like title updates
+        data = re.sub(r'\x1b\].*?(\x07|\x1b\\)', '', data)
+        # Strip other miscellaneous codes
+        data = re.sub(r'\x1b[()][AB012]', '', data)
+        return data
+
+    def update_terminal(self):
+        if self.term_fd is None: return
+        try:
+            r, _, _ = select.select([self.term_fd], [], [], 0)
+            if r:
+                data = os.read(self.term_fd, 8192)
+                self.terminal.write(data)
+        except (OSError, EOFError):
+            self.term_fd = None
+            self.mode = NORMAL
+
+    def draw_terminal(self, h, w):
+        if not self.terminal: return
+        for y in range(h - 2):
+            for x in range(w):
+                char, attr = self.terminal.screen[y][x]
+                try:
+                    self.stdscr.addch(y, x, char, attr)
+                except curses.error:
+                    pass
+        
+        # Move cursor
+        ty, tx = self.terminal.cursor_y, self.terminal.cursor_x
+        if 0 <= ty < h - 2 and 0 <= tx < w:
+            self.stdscr.move(ty, tx)
+
     def draw_statusline(self, h, w):
         # Background for statusline
         self.stdscr.addstr(h - 2, 0, " " * (w - 1), curses.color_pair(23))
         
         # Mode Segment
-        mode_colors = {NORMAL: 20, INSERT: 21, COMMAND: 22, CONFIG: 1}
+        mode_colors = {NORMAL: 20, INSERT: 21, COMMAND: 22, CONFIG: 1, TERMINAL: 22}
         mode_pair = mode_colors.get(self.mode, 20)
         mode_str = f" {self.mode} "
         self.stdscr.addstr(h - 2, 0, mode_str, curses.color_pair(mode_pair) | curses.A_BOLD)
         
         # Filename Segment
-        filename = self.filename or "[No Name]"
+        filename = "TERMINAL" if self.mode == TERMINAL else (self.filename or "[No Name]")
         self.stdscr.addstr(h - 2, len(mode_str) + 1, f" {filename} ", curses.color_pair(23))
         
         # Position Segment
-        pos_str = f" LOC: {self.cursor_y + 1}:{self.cursor_x + 1} "
-        self.stdscr.addstr(h - 2, w - len(pos_str) - 1, pos_str, curses.color_pair(20) | curses.A_BOLD)
+        if self.mode != TERMINAL:
+            pos_str = f" LOC: {self.cursor_y + 1}:{self.cursor_x + 1} "
+            self.stdscr.addstr(h - 2, w - len(pos_str) - 1, pos_str, curses.color_pair(20) | curses.A_BOLD)
 
     def draw_hintbar(self, h, w):
-        hints = " [i] Insert  [:] Command  [h/j/k/l] Move  [u] Undo  [r] Redo "
+        if self.mode == TERMINAL:
+            hints = " [Ctrl+W] Exit Terminal "
+        else:
+            hints = " [i] Insert  [:] Command  [h/j/k/l] Move  [u] Undo  [r] Redo "
         self.stdscr.addstr(h - 1, 0, hints[:w-1], curses.A_DIM)
 
     def draw(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
         self.stdscr.bkgd(' ', curses.color_pair(5))
+
+        if self.mode == TERMINAL:
+            self.draw_terminal(h, w)
+            self.draw_statusline(h, w)
+            self.draw_hintbar(h, w)
+            self.stdscr.refresh()
+            return
 
         if self.show_dashboard:
             self.draw_dashboard()
@@ -679,8 +845,90 @@ class Editor:
                 label = label[:w - px - 1]
             try:
                 self.stdscr.addstr(py + i, px, label, style)
-            except curses.error:
+            except:
                 pass
+
+class TerminalEmulator:
+    def __init__(self, h, w):
+        self.h = h
+        self.w = w
+        self.cursor_x = 0
+        self.cursor_y = 0
+        self.current_attr = curses.color_pair(5)
+        self.screen = [[(' ', curses.color_pair(5)) for _ in range(w)] for _ in range(h)]
+        self.ansi_buf = b""
+
+    def write(self, data):
+        i = 0
+        while i < len(data):
+            char = data[i:i+1]
+            if char == b'\x1b':
+                # Start of ANSI sequence
+                j = i + 1
+                while j < len(data) and not (0x40 <= data[j] <= 0x7E):
+                    j += 1
+                if j < len(data):
+                    self.handle_ansi(data[i:j+1])
+                    i = j + 1
+                    continue
+            
+            c = char[0]
+            if c == 13: # CR
+                self.cursor_x = 0
+            elif c == 10: # LF
+                self.cursor_y += 1
+                if self.cursor_y >= self.h:
+                    self.scroll()
+            elif c == 8: # BS
+                self.cursor_x = max(0, self.cursor_x - 1)
+            elif c == 7: # BEL
+                pass
+            elif 32 <= c <= 126:
+                if self.cursor_x < self.w:
+                    self.screen[self.cursor_y][self.cursor_x] = (chr(c), self.current_attr)
+                    self.cursor_x += 1
+                    if self.cursor_x >= self.w:
+                        self.cursor_x = 0
+                        self.cursor_y += 1
+                        if self.cursor_y >= self.h:
+                            self.scroll()
+            i += 1
+
+    def scroll(self):
+        self.screen.pop(0)
+        self.screen.append([(' ', curses.color_pair(5)) for _ in range(self.w)])
+        self.cursor_y = self.h - 1
+
+    def handle_ansi(self, seq):
+        if not seq.startswith(b'\x1b['): return
+        cmd = chr(seq[-1])
+        params = seq[2:-1].split(b';')
+        
+        try:
+            nums = [int(p) if p else 0 for p in params]
+        except ValueError:
+            nums = [0]
+
+        if cmd == 'm': # SGR
+            for n in nums:
+                if n == 0: self.current_attr = curses.color_pair(5)
+                elif 30 <= n <= 37: # FG
+                    self.current_attr = curses.color_pair(40 + (n - 30))
+                elif 40 <= n <= 47: # BG
+                    pass # Simple impl ignores BG for now
+                elif n == 1: self.current_attr |= curses.A_BOLD
+        elif cmd == 'H' or cmd == 'f': # CUP
+            y = max(0, min(self.h - 1, (nums[0] if nums else 1) - 1))
+            x = max(0, min(self.w - 1, (nums[1] if len(nums) > 1 else 1) - 1))
+            self.cursor_y, self.cursor_x = y, x
+        elif cmd == 'J': # ED
+            n = nums[0] if nums else 0
+            if n == 2: # Clear entire screen
+                self.screen = [[(' ', curses.color_pair(5)) for _ in range(self.w)] for _ in range(self.h)]
+                self.cursor_x = self.cursor_y = 0
+        elif cmd == 'K': # EL
+            for x in range(self.cursor_x, self.w):
+                self.screen[self.cursor_y][x] = (' ', self.current_attr)
 
 class PythonLSP:
     def __init__(self):
